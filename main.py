@@ -1,413 +1,627 @@
-"""
-main.py — Conformal Adaptive Control Simulation
-
-Runs a Dynamic Tube MPC (DTMPC) simulation with an SSML neural network for
-disturbance estimation and Online Conformal Prediction (OCP) for safety bounds.
-
-Usage:
-    python main.py --scenario adaptation_off   # frozen pre-trained model (default)
-    python main.py --scenario adaptation_on    # online weight adaptation enabled
-
-The scenario files in scenarios/ define all tunable parameters. To create a new
-scenario, copy an existing one and modify the ScenarioConfig fields.
-"""
-import os
 import argparse
 import collections
 import importlib
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
+import matplotlib
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-plt.switch_backend('Agg')
-plt.rcParams.update({
-    'font.size': 14,
-    'axes.titlesize': 18,
-    'axes.labelsize': 16,
-    'xtick.labelsize': 14,
-    'ytick.labelsize': 14,
-    'legend.fontsize': 10,
-    'figure.titlesize': 20
-})
-
 from plant import Plant
-from ocp import StaggeredDriftScoreOCP
 from controller import DynamicTubeMPC
+from ocp import StaggeredDriftScoreOCP
 from ssml import (
-    get_or_train_model, flatten_params, assign_params,
-    compute_jacobian, spectral_normalization_clip
+    get_or_train_model,
+    flatten_params,
+    assign_params,
+    compute_jacobian,
+    spectral_normalization_clip,
 )
 
 
-def load_scenario(name: str):
-    """Imports and returns the `scenario` object from scenarios/<name>.py."""
-    try:
-        module = importlib.import_module(f"scenarios.{name}")
-    except ModuleNotFoundError:
-        raise SystemExit(
-            f"Error: scenario '{name}' not found. "
-            f"Expected file: scenarios/{name}.py"
+# Kích thước quỹ đạo, đơn vị mét.
+SINE_AMPLITUDE = 0.5
+CIRCLE_RADIUS = 1.0
+INFINITY_X = 2.0
+INFINITY_Y = 0.75
+
+PATHS = ("straight", "circle", "infinity", "sine")
+
+
+def reference_state(t, start, goal, duration, trajectory):
+    """Tham chiếu [x, y, z, vx, vy, vz, roll, pitch]."""
+    u = np.clip(float(t) / duration, 0.0, 1.0)
+
+    # Vận tốc bằng 0 tại đầu và cuối.
+    s = 10*u**3 - 15*u**4 + 6*u**5
+    ds = (30*u**2 - 60*u**3 + 30*u**4) / duration
+
+    theta = 2*np.pi*s
+    omega = 2*np.pi*ds
+
+    ref = np.zeros(8)
+    ref[:3] = start[:3]
+
+    if trajectory in ("straight", "sine"):
+        ref[:3] += s * (goal[:3] - start[:3])
+        ref[3:6] = ds * (goal[:3] - start[:3])
+
+        if trajectory == "sine":
+            ref[1] += SINE_AMPLITUDE * np.sin(theta)
+            ref[4] += (
+                SINE_AMPLITUDE * np.cos(theta) * omega
+            )
+
+    elif trajectory == "circle":
+        # Bắt đầu tại start, tâm lệch sang phải một bán kính.
+        ref[0] += CIRCLE_RADIUS * (1 - np.cos(theta))
+        ref[1] += CIRCLE_RADIUS * np.sin(theta)
+
+        ref[3] = CIRCLE_RADIUS * np.sin(theta) * omega
+        ref[4] = CIRCLE_RADIUS * np.cos(theta) * omega
+
+    elif trajectory == "infinity":
+        # Số 8 nằm ngang; bắt đầu tại giao điểm giữa.
+        ref[0] += INFINITY_X * np.sin(theta)
+        ref[1] += INFINITY_Y * np.sin(2*theta)
+
+        ref[3] = INFINITY_X * np.cos(theta) * omega
+        ref[4] = (
+            2 * INFINITY_Y * np.cos(2*theta) * omega
         )
-    if not hasattr(module, 'scenario'):
-        raise SystemExit(
-            f"Error: scenarios/{name}.py must define a `scenario` variable "
-            f"of type ScenarioConfig."
-        )
-    return module.scenario
+
+    else:
+        raise ValueError(f"Unknown trajectory: {trajectory}")
+
+    return ref
 
 
 def compute_dist_bound(q_k, L_d, T_p):
-    """
-    Converts an OCP integral quantile q_k to a disturbance distance bound.
-
-    Uses a piecewise formula derived from the Lipschitz structure of the disturbance:
-        - If the implied triangle fits in T_p: d_bar = sqrt(2 * L_d * q_k)
-        - Otherwise:                           d_bar = q_k / T_p + 0.5 * L_d * T_p
-    """
-    thresh = 0.5 * L_d * (T_p ** 2)
-    T_safe = max(T_p, 1e-8)
+    # Giữ công thức trong main.py bạn gửi.
     return np.where(
-        q_k < thresh,
-        q_k / T_safe + 0.5 * L_d * T_p,
-        np.sqrt(2.0 * L_d * q_k)
+        q_k < 0.5 * L_d * T_p**2,
+        q_k / max(T_p, 1e-8) + 0.5 * L_d * T_p,
+        np.sqrt(2.0 * L_d * q_k),
     )
 
 
-def main():
-    # ── CLI ──────────────────────────────────────────────────────────────────
-    parser = argparse.ArgumentParser(description="Conformal Adaptive Control Simulation")
-    parser.add_argument(
-        "--scenario", default="adaptation_off",
-        help="Scenario name to load from scenarios/<name>.py (default: adaptation_off)"
+def save_outputs(
+    out,
+    trajectory,
+    times,
+    actual,
+    target,
+    curve,
+    bounds,
+    residuals,
+    weights,
+    dt_sim,
+    make_gif,
+):
+    errors = np.linalg.norm(
+        actual[:, :3] - target[:, :3],
+        axis=1,
     )
-    args = parser.parse_args()
 
-    # Ensure output directory exists
-    os.makedirs("output", exist_ok=True)
+    print(
+        f"{trajectory}: "
+        f"RMSE={np.sqrt(np.mean(errors**2)):.3f} m; "
+        f"max={errors.max():.3f} m"
+    )
 
-    cfg = load_scenario(args.scenario)
-    cfg.obstacles = []  # Run the controller in an obstacle-free environment.
-    print(f"\n{'='*60}")
-    print(f"  Scenario: {cfg.name}")
-    print(f"  gamma_lr = {cfg.gamma_lr}  |  t_end = {cfg.t_end}s  |  H = {cfg.mpc_horizon}")
-    print(f"{'='*60}\n")
+    np.savez(
+        out / "tracking_data.npz",
+        time=times,
+        actual=actual,
+        reference=target,
+        position_error=errors,
+    )
 
-    # ── Seeds ─────────────────────────────────────────────────────────────────
+    # PNG: đường tham chiếu và đường thực tế.
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    ax.plot(
+        curve[:, 0],
+        curve[:, 1],
+        "r--",
+        lw=2,
+        label="Reference trajectory",
+    )
+    ax.plot(
+        actual[:, 0],
+        actual[:, 1],
+        "b-",
+        lw=2,
+        label="Actual trajectory",
+    )
+
+    ax.set(
+        xlabel="X Position (m)",
+        ylabel="Y Position (m)",
+        title=f"Trajectory tracking: {trajectory}",
+    )
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+
+    fig.savefig(
+        out / "top_down_tube.png",
+        dpi=150,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+    # Sai số bám vị trí 3D.
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(times, errors)
+    ax.set(
+        xlabel="Time (s)",
+        ylabel="3D position error (m)",
+    )
+    ax.grid(True)
+    fig.tight_layout()
+    fig.savefig(out / "tracking_error.png", dpi=150)
+    plt.close(fig)
+
+    # Disturbance bound.
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.fill_between(
+        times,
+        0,
+        bounds,
+        alpha=0.4,
+        label="SI-OCP Prediction Bound",
+    )
+    ax.plot(
+        times,
+        residuals,
+        label="True disturbance residual",
+    )
+    ax.set(
+        xlabel="Time (s)",
+        ylabel="Disturbance norm",
+    )
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out / "si-ocp_vs_true.png", dpi=150)
+    plt.close(fig)
+
+    # Tham số neural network.
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(times, weights, alpha=0.1, lw=1)
+    ax.set(
+        xlabel="Time (s)",
+        ylabel="NN weight values",
+    )
+    ax.grid(True)
+    fig.tight_layout()
+    fig.savefig(out / "nn_params_vs_time.png", dpi=150)
+    plt.close(fig)
+
+    if make_gif:
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        ax.plot(
+            curve[:, 0],
+            curve[:, 1],
+            "r--",
+            lw=2,
+            label="Reference trajectory",
+        )
+        line, = ax.plot(
+            [],
+            [],
+            "b-",
+            lw=2,
+            label="Actual trajectory",
+        )
+        point, = ax.plot(
+            [],
+            [],
+            "bo",
+            markersize=5,
+        )
+
+        xy = np.vstack((curve[:, :2], actual[:, :2]))
+
+        ax.set_xlim(
+            xy[:, 0].min() - 0.5,
+            xy[:, 0].max() + 0.5,
+        )
+        ax.set_ylim(
+            xy[:, 1].min() - 0.5,
+            xy[:, 1].max() + 0.5,
+        )
+        ax.set(
+            xlabel="X Position (m)",
+            ylabel="Y Position (m)",
+        )
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True)
+        ax.legend()
+        fig.tight_layout()
+
+        def update(k):
+            line.set_data(
+                actual[:k + 1, 0],
+                actual[:k + 1, 1],
+            )
+            point.set_data(
+                actual[k:k + 1, 0],
+                actual[k:k + 1, 1],
+            )
+            ax.set_title(
+                f"{trajectory} | t={times[k]:.2f}s"
+            )
+            return line, point
+
+        # Khoảng 10 khung hình/giây.
+        # Không thay đổi bước tính toán mô phỏng.
+        skip = max(1, int(round(0.1 / dt_sim)))
+        frames = list(range(0, len(times), skip))
+
+        if frames[-1] != len(times) - 1:
+            frames.append(len(times) - 1)
+
+        ani = animation.FuncAnimation(
+            fig,
+            update,
+            frames=frames,
+            interval=1000 * dt_sim * skip,
+            blit=False,
+        )
+        ani.save(
+            out / "top_down_animation.gif",
+            writer="pillow",
+            fps=1.0 / (dt_sim * skip),
+        )
+        plt.close(fig)
+
+    print(f"Saved: {out}")
+
+
+def run_case(cfg, trajectory, duration, out, make_gif):
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Mỗi test bắt đầu lại với cùng seed và weights.
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    # ── Timing ────────────────────────────────────────────────────────────────
-    t = 0.0
     dt_sim = cfg.dt_sim
     dt_mpc = cfg.dt_mpc
     n_substeps = int(round(dt_mpc / dt_sim))
-    t_end = cfg.t_end
 
-    # ── System components ─────────────────────────────────────────────────────
-    sys_plant = Plant(spatial_mode=cfg.spatial_wind)
-    sys_controller = DynamicTubeMPC(
-        plant=sys_plant,
-        obstacles=cfg.obstacles,
+    if (
+        duration <= 0
+        or n_substeps < 1
+        or not np.isclose(n_substeps * dt_sim, dt_mpc)
+    ):
+        raise ValueError(
+            "duration > 0; dt_mpc phải là bội nguyên của dt_sim"
+        )
+
+    steps = int(round(duration / dt_sim))
+
+    if (
+        steps < 1
+        or not np.isclose(steps * dt_sim, duration)
+    ):
+        raise ValueError(
+            "duration phải là bội nguyên của dt_sim"
+        )
+
+    plant = Plant(spatial_mode=cfg.spatial_wind)
+
+    # Không có vật cản.
+    controller = DynamicTubeMPC(
+        plant,
+        obstacles=[],
         H=cfg.mpc_horizon,
         dt=dt_mpc,
     )
 
-    # ── OCP ───────────────────────────────────────────────────────────────────
-    T_window = int(cfg.mpc_horizon * dt_mpc / dt_sim)  # steps in one MPC horizon
-    ocp_integral = StaggeredDriftScoreOCP(
+    window = cfg.mpc_horizon * n_substeps
+    T_p = window * dt_sim
+
+    ocp = StaggeredDriftScoreOCP(
         alpha=cfg.alpha_ocp,
         eta_const=cfg.eta_ocp,
-        N_threads=T_window,
+        N_threads=window,
         q_init=cfg.q_init_ocp,
     )
-    T_p = T_window * dt_sim  # horizon duration in seconds
 
-    # ── SSML model ───────────────────────────────────────────────────────────
     model = get_or_train_model()
-    theta_0_flat = flatten_params(model).clone().detach()
-    theta_flat   = flatten_params(model).clone().detach()
+    theta0 = flatten_params(model).clone().detach()
+    theta = theta0.clone().detach()
 
-    # ── State ─────────────────────────────────────────────────────────────────
-    x     = np.copy(cfg.x0)
-    u     = np.array([0.0, 0.0, 9.81 * sys_plant.m])
-    u_old = np.copy(u)
+    x = np.copy(cfg.x0)
+    u = np.array([0.0, 0.0, 9.81 * plant.m])
 
-    x_goal      = cfg.x_goal
-    goal_radius = cfg.goal_radius
+    # Giữ cách tính residual của main.py bạn gửi.
+    u_old = u.copy()
 
-    # ── Logging buffers ───────────────────────────────────────────────────────
-    x_plotting         = [np.copy(x)]
-    t_plotting         = [t]
-    z_pred_plotting    = [np.tile(x, (sys_controller.H, 1))]
-    phi_pred_plotting  = [np.tile(sys_controller.Phi, sys_controller.H)]
+    past_x = collections.deque(maxlen=window)
+    past_f = collections.deque(maxlen=window)
 
-    past_states        = collections.deque(maxlen=T_window)
-    past_f_nom         = collections.deque(maxlen=T_window)
+    states = [x.copy()]
+    times = [0.0]
+    bounds = [cfg.dist_bound_init]
+    residuals = [0.0]
+    weights = [theta.numpy().copy()]
 
-    dist_bound_plotting = [cfg.dist_bound_init]
-    xd_plotting       = []
-    tube_plotting     = [sys_controller.Phi]
-    theta_plotting    = [theta_flat.detach().numpy().copy()]
-    disturbance_norm_plotting = [0.0]
+    covered = 0
+    completed = True
 
-    correct_bounds_count = 0
-    total_steps_count    = 0
+    def ref(t):
+        return reference_state(
+            t,
+            cfg.x0,
+            cfg.x_goal,
+            duration,
+            trajectory,
+        )
 
+    print(
+        f"\nScenario={cfg.name}; "
+        f"trajectory={trajectory}; "
+        f"duration={duration}s"
+    )
 
+    for k in range(steps):
+        t = k * dt_sim
 
-    print("Running SSML DTMPC 3D Flight Simulation...")
-    mpc_step_counter   = 0
-    t_sim_block_start  = time.time()
-    xd = x_goal
+        if k % n_substeps == 0:
+            horizon = np.array([
+                ref(t + (j + 1) * dt_mpc)
+                for j in range(controller.H)
+            ])
 
-    # ── Simulation loop ───────────────────────────────────────────────────────
-    while t <= t_end:
-
-        # 1. MPC update (every n_substeps plant steps)
-        if int(t / dt_sim + 0.5) % n_substeps == 0:
-            mpc_step_counter += 1
-            t_solve_start = time.time()
-            dist_bound_ocp = float(compute_dist_bound(ocp_integral.get_quantile(), cfg.ddot_bound, T_p))
-            u, z_pred, phi_pred, success = sys_controller.compute_u(
-                x, xd, dist_bound_ocp, model_nn=model
+            bound = float(
+                compute_dist_bound(
+                    ocp.get_quantile(),
+                    cfg.ddot_bound,
+                    T_p,
+                )
             )
-            solve_time = time.time() - t_solve_start
 
-            if mpc_step_counter % 10 == 0:
-                t_now = time.time()
-                sim_block_time = t_now - t_sim_block_start
-                print(f"t: {t:.2f}s | MPC Solve: {solve_time:.4f}s | Last 50 steps: {sim_block_time:.4f}s")
-                t_sim_block_start = t_now
+            tic = time.perf_counter()
+
+            u, _, _, success = controller.compute_u(
+                x,
+                horizon,
+                bound,
+                model_nn=model,
+            )
 
             if not success:
-                print(f"Solver failed at t={t:.2f}s! Ending simulation early.")
+                print(
+                    f"Solver failed at t={t:.2f}s; "
+                    "test incomplete."
+                )
+                completed = False
                 break
-            z_pred_plotting.append(z_pred)
-            phi_pred_plotting.append(phi_pred)
-            xd_plotting.append(np.copy(xd))
-        else:
-            z_pred_plotting.append(z_pred_plotting[-1])
-            phi_pred_plotting.append(phi_pred_plotting[-1])
-            xd_plotting.append(xd_plotting[-1])
 
-        x_old = np.copy(x)
+            if k % (20 * n_substeps) == 0:
+                print(
+                    f"t={t:.2f}s; "
+                    f"MPC={time.perf_counter()-tic:.3f}s"
+                )
 
-        # 2. Plant step
-        x = sys_plant.step(x_old, u, t, dt_sim)
+        old = x.copy()
+        x = plant.step(old, u, t, dt_sim)
 
-        # 3. Neural network prediction
-        x_in = np.concatenate((x_old[3:6], x_old[6:8]))
-        with torch.no_grad():
-            f_nn_acc = model(torch.tensor(x_in, dtype=torch.float32)).numpy()
-
-        x_dot_pred = (
-            sys_plant.f(x_old)
-            + sys_plant.g_mat(x_old) @ u_old
-            + np.concatenate([np.zeros(3), f_nn_acc, np.zeros(2)])
-        )
-
-        # True dynamics (ground truth, for monitoring only)
-        x_dot_true     = sys_plant.dynamics(t, x_old, u_old)
-        error_acc_true = (x_dot_true - x_dot_pred)[3:6]
-
-        # Finite-difference acceleration mismatch for DNN
-        v_dot_est  = (x[3:6] - x_old[3:6]) / dt_sim
-        error_acc  = v_dot_est - x_dot_pred[3:6]
-
-        # 4. Rolling-window integral OCP score
-        past_states.append(np.copy(x_old))
-        past_f_nom.append(np.copy(x_dot_pred))
-
-        L     = len(past_states)
-        S_I   = 0.0
-
-        if L >= T_window:
-            x_buffer     = np.array(past_states)
-            f_nom_buffer = np.array(past_f_nom)
-
-            x_k           = x_buffer[-1]
-            f_nom_rev     = np.flip(f_nom_buffer, axis=0)
-            x_rev         = np.flip(x_buffer, axis=0)
-            integrals_rev = np.cumsum(f_nom_rev, axis=0) * dt_sim
-            pred_errors   = x_k - x_rev - integrals_rev
-            error_norms   = np.linalg.norm(pred_errors, axis=1)
-            S_I           = np.max(error_norms)
-
-            q_I        = ocp_integral.update(S_I)
-            dist_bound = float(compute_dist_bound(q_I, cfg.ddot_bound, T_p))
-        else:
-            dist_bound = cfg.dist_bound_init
-
-        # 6. Jacobian calculation
-        J = compute_jacobian(model, x_in).detach().numpy()
-
-        # 7. Coverage tracking
-        total_steps_count += 1
-        if np.linalg.norm(error_acc_true) <= dist_bound:
-            correct_bounds_count += 1
-
-        # 8. Online adaptation (only when gamma_lr > 0)
-        theta_dot = cfg.gamma_lr * np.dot(J.T, error_acc) - cfg.lambd * (
-            theta_flat.detach().numpy() - theta_0_flat.numpy()
-        )
-        theta_flat         = theta_flat + torch.tensor(theta_dot, dtype=torch.float32) * dt_sim
-
-        assign_params(model, theta_flat)
-        spectral_normalization_clip(model)
-
-
-
-        # 9. Log
-        t += dt_sim
-        x_plotting.append(np.copy(x))
-        t_plotting.append(t)
-        dist_bound_plotting.append(dist_bound)
-        tube_plotting.append(sys_controller.Phi)
-        theta_plotting.append(theta_flat.detach().numpy().copy())
-        disturbance_norm_plotting.append(np.linalg.norm(error_acc_true))
-
-        # 10. Termination checks
-        stop_flag = False
-        for obs in cfg.obstacles:
-            if np.linalg.norm(x[:3] - obs['pos']) < obs['r']:
-                print(f"COLLISION at t={t:.2f}s! Penetrated obstacle at {obs['pos']}")
-                stop_flag = True
-                break
-        goal_dist = np.linalg.norm(x[:3] - x_goal[:3])
-        if goal_dist < goal_radius:
-            print(f"Goal region reached at t={t:.2f}s! Distance: {goal_dist:.3f}m")
-            stop_flag = True
-        if stop_flag:
+        if not np.isfinite(x).all():
+            completed = False
+            print(
+                f"Nonfinite state at t={t+dt_sim:.2f}s; "
+                "test incomplete."
+            )
             break
 
-    # Pad terminal target
-    xd_plotting.append(np.copy(x_goal))
+        x_in = np.concatenate((old[3:6], old[6:8]))
 
-    # ── Convert to arrays ─────────────────────────────────────────────────────
-    x_history         = np.array(x_plotting)
-    t_history         = np.array(t_plotting)
-    xd_history        = np.array(xd_plotting)
-    z_pred_hist       = np.array(z_pred_plotting)
-    phi_pred_hist     = np.array(phi_pred_plotting)
-    dist_bound_history = np.array(dist_bound_plotting)
-    disturbance_norm_history = np.array(disturbance_norm_plotting)
-    tube_history      = np.array(tube_plotting)
-    theta_history     = np.array(theta_plotting)
+        with torch.no_grad():
+            nn_acc = model(
+                torch.tensor(x_in, dtype=torch.float32)
+            ).numpy()
 
-    # ── Validation ────────────────────────────────────────────────────────────
-    print("Obstacle-free simulation: no obstacle clearance to report.")
+        pred = (
+            plant.f(old)
+            + plant.g_mat(old) @ u_old
+            + np.concatenate((
+                np.zeros(3),
+                nn_acc,
+                np.zeros(2),
+            ))
+        )
 
-    if total_steps_count > 0:
-        coverage = correct_bounds_count / total_steps_count
-        print(f"\n--- Empirical Coverage Report ---")
-        print(f"Disturbance bounded {correct_bounds_count}/{total_steps_count} steps.")
-        print(f"Empirical Coverage: {coverage:.2%} (Target: {1-cfg.alpha_ocp:.1%})")
-        print(f"---------------------------------\n")
+        true_error = (
+            plant.dynamics(t, old, u_old) - pred
+        )[3:6]
 
-    # ── Plots ─────────────────────────────────────────────────────────────────
-    # SI-OCP bounds vs. true error
-    indices = np.arange(len(t_history))
-    fig_bounds, ax_b1 = plt.subplots(1, 1, figsize=(10, 5))
-    ax_b1.fill_between(indices, 0, dist_bound_history, color='#aae0fa', alpha=0.8, label='SI-OCP Prediction Bound')
-    ax_b1.plot(indices, dist_bound_history, 'k-', linewidth=1.5)
-    ax_b1.plot(indices, disturbance_norm_history, color='#D95319', label=r'True $d(t)$', linewidth=1.5)
-    ax_b1.set_xlim(0, int(t_end / dt_sim)); ax_b1.set_ylim(bottom=0)
-    ax_b1.set_xlabel(f'Time (x {dt_sim:.2f} s)'); ax_b1.set_ylabel(r'$\Vert d \Vert$')
-    ax_b1.legend(loc='upper right'); ax_b1.grid(True, linestyle=':', alpha=0.7)
-    fig_bounds.tight_layout()
-    fig_bounds.savefig('output/si-ocp_vs_true.png', dpi=150, bbox_inches='tight')
-    print("Plot saved to output/si-ocp_vs_true.png")
+        error_acc = (
+            (x[3:6] - old[3:6]) / dt_sim
+            - pred[3:6]
+        )
 
-    # Neural network parameters
-    fig_theta, ax_theta = plt.subplots(1, 1, figsize=(10, 6))
-    ax_theta.plot(t_history, theta_history, alpha=0.1, linewidth=1)
-    ax_theta.set_xlabel('Time (s)'); ax_theta.set_ylabel(r'NN Weight Values $\theta$')
-    ax_theta.set_title('Neural Network Parameters Evolution')
-    ax_theta.set_xlim([0, t_end]); ax_theta.grid(True); fig_theta.tight_layout()
-    fig_theta.savefig('output/nn_params_vs_time.png', dpi=150, bbox_inches='tight')
-    print("Plot saved to output/nn_params_vs_time.png")
+        past_x.append(old)
+        past_f.append(pred.copy())
 
-    # Top-down tube plot
-    fig_top, ax_top = plt.subplots(1, 1, figsize=(8, 8))
-    ax_top.plot(x_history[:, 0], x_history[:, 1], 'b-', linewidth=2)
+        if len(past_x) >= window:
+            xb = np.array(past_x)
+            fb = np.array(past_f)
 
-    from matplotlib.patches import Polygon, Circle
-    def draw_continuous_tube(ax, path_xy, R, color='c', alpha=0.2):
-        radii = np.full(len(path_xy), R) if np.isscalar(R) else np.asarray(R)
-        if len(path_xy) < 2:
-            return None
-        N = len(path_xy)
-        tangents = np.zeros_like(path_xy)
-        for i in range(1, N - 1):
-            t_vec = path_xy[i+1] - path_xy[i-1]
-            tangents[i] = t_vec / (np.linalg.norm(t_vec) + 1e-8)
-        t0 = path_xy[1] - path_xy[0]
-        tangents[0] = t0 / (np.linalg.norm(t0) + 1e-8)
-        tn = path_xy[N-1] - path_xy[N-2]
-        tangents[-1] = tn / (np.linalg.norm(tn) + 1e-8)
-        normals = np.stack([-tangents[:, 1], tangents[:, 0]], axis=1)
-        left_pts  = path_xy + normals * radii[:, np.newaxis]
-        right_pts = path_xy - normals * radii[:, np.newaxis]
-        theta_t = np.arctan2(tangents[-1, 1], tangents[-1, 0])
-        angles = np.linspace(theta_t + np.pi/2, theta_t - np.pi/2, 15)
-        center, r_end = path_xy[-1], radii[-1]
-        semicircle_pts = np.vstack([
-            center[0] + r_end * np.cos(angles),
-            center[1] + r_end * np.sin(angles)
-        ]).T
-        poly_pts = np.vstack((left_pts[:-1], semicircle_pts, right_pts[-2::-1]))
-        return ax.add_patch(Polygon(poly_pts, closed=True, facecolor=color, edgecolor=color, alpha=alpha, zorder=2))
- 
-    ax_top.set_xlabel('X Position (m)'); ax_top.set_ylabel('Y Position (m)')
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
-    custom_handles = [
-        Line2D([0], [0], color='b', lw=2, label='Trajectory'),
-    ]
-    ax_top.legend(handles=custom_handles, loc='upper right')
-    ax_top.grid(True); ax_top.set_aspect('equal'); fig_top.tight_layout()
-    fig_top.savefig('output/top_down_tube.png', dpi=150, bbox_inches='tight')
-    print("Plot saved to output/top_down_tube.png")
+            integral = np.cumsum(
+                np.flip(fb, axis=0),
+                axis=0,
+            ) * dt_sim
 
-    # ── Top-down animation ────────────────────────────────────────────────────
-    print("Generating top-down animation...")
-    fig_td = plt.figure(figsize=(8, 6))
-    ax_td  = fig_td.add_subplot(111)
+            score = np.linalg.norm(
+                xb[-1] - np.flip(xb, axis=0) - integral,
+                axis=1,
+            ).max()
 
-    line_true_td, = ax_td.plot([], [], 'b-', label='Trajectory', linewidth=2)
+            q = ocp.update(score)
 
-    def init_td():
-        line_true_td.set_data([], [])
-        return (line_true_td,)
+            bound = float(
+                compute_dist_bound(
+                    q,
+                    cfg.ddot_bound,
+                    T_p,
+                )
+            )
+        else:
+            bound = cfg.dist_bound_init
 
-    def update_graph_td(k):
-        line_true_td.set_data(x_history[:k+1, 0], x_history[:k+1, 1])
-        ax_td.set_title(f'Trajectory | t={t_history[k]:.2f}s')
-        return (line_true_td,)
+        J = compute_jacobian(
+            model, x_in
+        ).detach().numpy()
 
-    x_lo = np.min(x_history[:, 0]) - 0.5; x_hi = np.max(x_history[:, 0]) + 0.5
-    ax_td.set_xlim([x_lo, x_hi]); ax_td.set_ylim([-2.5, 2.5])
-    ax_td.set_aspect('equal'); ax_td.set_xlabel('X Position (m)'); ax_td.set_ylabel('Y Position (m)')
-    ax_td.legend(handles=custom_handles, loc='upper right')
-    ax_td.grid(True)
-    # Calculate real-time animation parameters
-    ani_skip = 1
-    ani_interval = ani_skip * cfg.dt_sim * 1000  # ms between frames for real-time
-    ani_fps = 1.0 / (ani_skip * cfg.dt_sim)      # frames per second for real-time
+        covered += int(
+            np.linalg.norm(true_error) <= bound
+        )
 
-    ani_td = animation.FuncAnimation(
-        fig_td, update_graph_td, init_func=init_td,
-        frames=range(0, len(x_history), ani_skip), interval=ani_interval, blit=False
+        theta_dot = (
+            cfg.gamma_lr * (J.T @ error_acc)
+            - cfg.lambd * (
+                theta.numpy() - theta0.numpy()
+            )
+        )
+
+        theta = theta + torch.tensor(
+            theta_dot,
+            dtype=torch.float32,
+        ) * dt_sim
+
+        assign_params(model, theta)
+        spectral_normalization_clip(model)
+
+        states.append(x.copy())
+        times.append((k + 1) * dt_sim)
+        bounds.append(bound)
+        residuals.append(np.linalg.norm(true_error))
+        weights.append(theta.numpy().copy())
+
+    states = np.array(states)
+    times = np.array(times)
+
+    target = np.array([
+        ref(t) for t in times
+    ])
+    curve = np.array([
+        ref(t)
+        for t in np.linspace(0, duration, 500)
+    ])
+
+    count = len(times) - 1
+
+    print(
+        f"Completed={completed}; "
+        f"steps={count}/{steps}"
     )
-    ani_td.save('output/top_down_animation.gif', writer='pillow', fps=ani_fps)
-    print(f"Top-down animation saved to output/top_down_animation.gif")
+
+    if count:
+        print(
+            f"Coverage={covered/count:.2%}; "
+            f"target={1-cfg.alpha_ocp:.1%}"
+        )
+
+    save_outputs(
+        out,
+        trajectory,
+        times,
+        states,
+        target,
+        curve,
+        bounds,
+        residuals,
+        weights,
+        dt_sim,
+        make_gif,
+    )
+
+    return completed
 
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Drone trajectory tracking tests"
+    )
+
+    parser.add_argument(
+        "--scenario",
+        default="adaptation_off",
+    )
+    parser.add_argument(
+        "--trajectory",
+        choices=(*PATHS, "all"),
+        default="sine",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--no-gif",
+        action="store_true",
+    )
+
+    args = parser.parse_args()
+
+    cfg = importlib.import_module(
+        f"scenarios.{args.scenario}"
+    ).scenario
+
+    duration = (
+        cfg.t_end
+        if args.duration is None
+        else args.duration
+    )
+
+    if not np.isfinite(duration) or duration <= 0:
+        parser.error(
+            "duration phải là số hữu hạn > 0"
+        )
+
+    paths = (
+        PATHS
+        if args.trajectory == "all"
+        else (args.trajectory,)
+    )
+
+    all_completed = True
+
+    for path in paths:
+        out = (
+            Path("output")
+            / args.scenario
+            / path
+        )
+
+        ok = run_case(
+            cfg,
+            path,
+            duration,
+            out,
+            not args.no_gif,
+        )
+
+        all_completed = all_completed and ok
+
+    if not all_completed:
+        raise SystemExit(
+            "Có test chưa chạy hết thời gian; xem log ở trên."
+        )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
